@@ -19,6 +19,8 @@ const YT_DLP_BASE_ARGS = [
     '--js-runtimes', `deno:${DENO_PATH}`,
     '--remote-components', 'ejs:github',
     '--no-check-certificate',
+    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    '--concurrent-fragments', '5',
     '--newline'
 ];
 
@@ -30,8 +32,11 @@ function createJob(filename) {
         id,
         status: 'starting',
         percent: 0,
+        downloadedSize: '',
+        totalSize: '',
         speed: '',
         eta: '',
+        fragment: '',
         statusText: 'Starting download...',
         outputFile: null,
         filename: filename || 'video.mp4',
@@ -70,6 +75,18 @@ function runYtDlpJob(job, customArgs, outputFile) {
                 job.percent = Math.min(99, parseFloat(percentMatch[1]));
             }
 
+            const sizeMatch = trimmed.match(/([\d\.]+\s*[kMgGtT]i?B)\s+of\s+(~?\s*[\d\.]+\s*[kMgGtT]i?B)/i);
+            if (sizeMatch) {
+                job.downloadedSize = sizeMatch[1].trim();
+                job.totalSize = sizeMatch[2].trim();
+            }
+
+            const fragMatch = trimmed.match(/\(frag\s+(\d+\/\d+)\)/i) || trimmed.match(/(\d+)\s+of\s+(\d+)\s+fragments/i);
+            if (fragMatch) {
+                if (fragMatch[1] && fragMatch[2]) job.fragment = `frag ${fragMatch[1]}/${fragMatch[2]}`;
+                else if (fragMatch[1]) job.fragment = `frag ${fragMatch[1]}`;
+            }
+
             const speedMatch = trimmed.match(/at\s+([0-9\.\sA-Za-z\/]+s)/i);
             if (speedMatch) {
                 job.speed = speedMatch[1].trim();
@@ -81,9 +98,16 @@ function runYtDlpJob(job, customArgs, outputFile) {
             }
 
             if (job.status === 'downloading') {
-                const speedStr = job.speed ? ` • ${job.speed}` : '';
-                const etaStr = job.eta ? ` • ETA ${job.eta}` : '';
-                job.statusText = `${job.percent.toFixed(1)}%${speedStr}${etaStr}`;
+                const parts = [`${job.percent.toFixed(1)}%`];
+                if (job.downloadedSize && job.totalSize) {
+                    parts.push(`${job.downloadedSize} / ${job.totalSize}`);
+                } else if (job.fragment) {
+                    parts.push(job.fragment);
+                }
+                if (job.speed) parts.push(job.speed);
+                if (job.eta) parts.push(`ETA ${job.eta}`);
+
+                job.statusText = parts.join(' • ');
             }
         }
     });
