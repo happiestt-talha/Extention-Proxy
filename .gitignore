@@ -1,3 +1,9 @@
 node_modules/
 cookies.txt
 out.txt
+*.mp4
+*.part
+*.ytdl
+*.webm
+*.m4a
+*.m3u8

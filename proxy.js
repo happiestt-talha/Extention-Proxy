@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const fs = require('fs');
 const path = require('path');
@@ -10,38 +10,169 @@ const app = express();
 app.use(cors({ origin: '*' }));
 
 // Cookies exported from Brave via "Get cookies.txt LOCALLY" extension.
-// Re-export periodically if YouTube starts rejecting requests again
-// (cookies expire / get rotated over time).
 const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
 const DENO_PATH = 'C:\\Users\\mtalh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\\deno.exe';
 const YT_DLP_FLAGS = `--cookies "${COOKIES_FILE}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github --no-check-certificate`;
 
-async function downloadAndMerge(videoId, targetHeight, res, customFilename) {
-    const outputFile = path.join(__dirname, `${videoId}_${targetHeight}p_merged.mp4`);
-    const formatSelector = `bestvideo[height<=${targetHeight}]+bestaudio[ext=m4a]/bestaudio/best[height<=${targetHeight}]`;
-    const command = `yt-dlp -f "${formatSelector}" ${YT_DLP_FLAGS} --merge-output-format mp4 -o "${outputFile}" "https://www.youtube.com/watch?v=${videoId}"`;
-    console.log(`Running: ${command}`);
-    try {
-        const { stdout, stderr } = await execPromise(command);
-        console.log('yt-dlp output:', stdout);
-        if (stderr) console.error('yt-dlp stderr:', stderr);
-        if (!fs.existsSync(outputFile)) throw new Error('Merged file not found');
-        // Use the custom filename provided by the extension
-        const finalFilename = customFilename || `${videoId}.mp4`;
-        res.download(outputFile, finalFilename, (err) => {
-            if (err) console.error('Download send error:', err);
-            setTimeout(() => {
-                fs.unlink(outputFile, (unlinkErr) => {
-                    if (unlinkErr) console.error('Cleanup error:', unlinkErr);
-                    else console.log(`Deleted temp file: ${outputFile}`);
-                });
-            }, 5000);
-        });
-    } catch (err) {
-        console.error('Merge error:', err);
-        res.status(500).json({ error: err.message });
-    }
+const YT_DLP_BASE_ARGS = [
+    '--cookies', COOKIES_FILE,
+    '--js-runtimes', `deno:${DENO_PATH}`,
+    '--remote-components', 'ejs:github',
+    '--no-check-certificate',
+    '--newline'
+];
+
+const jobs = new Map();
+
+function createJob(filename) {
+    const id = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
+    const job = {
+        id,
+        status: 'starting',
+        percent: 0,
+        speed: '',
+        eta: '',
+        statusText: 'Starting download...',
+        outputFile: null,
+        filename: filename || 'video.mp4',
+        error: null
+    };
+    jobs.set(id, job);
+    return job;
 }
+
+function runYtDlpJob(job, customArgs, outputFile) {
+    job.outputFile = outputFile;
+    job.status = 'downloading';
+
+    const args = [...YT_DLP_BASE_ARGS, ...customArgs];
+    console.log(`[Job ${job.id}] Spawning: yt-dlp ${args.join(' ')}`);
+
+    const child = spawn('yt-dlp', args);
+
+    let stderrData = '';
+
+    child.stdout.on('data', (data) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+
+            if (trimmed.includes('[Merger]') || trimmed.includes('[ffmpeg]') || trimmed.includes('Merging')) {
+                job.status = 'merging';
+                job.statusText = 'Merging video & audio...';
+                job.percent = 99;
+                continue;
+            }
+
+            const percentMatch = trimmed.match(/(\d+(?:\.\d+)?)%/);
+            if (percentMatch) {
+                job.percent = Math.min(99, parseFloat(percentMatch[1]));
+            }
+
+            const speedMatch = trimmed.match(/at\s+([0-9\.\sA-Za-z\/]+s)/i);
+            if (speedMatch) {
+                job.speed = speedMatch[1].trim();
+            }
+
+            const etaMatch = trimmed.match(/ETA\s+([0-9:]+)/i);
+            if (etaMatch) {
+                job.eta = etaMatch[1].trim();
+            }
+
+            if (job.status === 'downloading') {
+                const speedStr = job.speed ? ` • ${job.speed}` : '';
+                const etaStr = job.eta ? ` • ETA ${job.eta}` : '';
+                job.statusText = `${job.percent.toFixed(1)}%${speedStr}${etaStr}`;
+            }
+        }
+    });
+
+    child.stderr.on('data', (data) => {
+        stderrData += data.toString();
+    });
+
+    child.on('close', (code) => {
+        if (code === 0 && fs.existsSync(outputFile)) {
+            job.status = 'completed';
+            job.percent = 100;
+            job.statusText = 'Completed!';
+            console.log(`[Job ${job.id}] Download complete: ${outputFile}`);
+        } else {
+            job.status = 'error';
+            job.error = stderrData.trim() || `yt-dlp process exited with code ${code}`;
+            job.statusText = `Failed`;
+            console.error(`[Job ${job.id}] Failed:`, job.error);
+        }
+    });
+}
+
+app.get('/start-download-url', (req, res) => {
+    const { mediaUrl, pageUrl, filename } = req.query;
+    if (!mediaUrl) return res.status(400).json({ error: 'Missing mediaUrl' });
+
+    const safeName = (filename || 'video').replace(/[^\w\-. ]/g, '_');
+    const outputFile = path.join(__dirname, `${Date.now()}_${safeName}`);
+    const job = createJob(filename || safeName);
+
+    const customArgs = [];
+    if (pageUrl) {
+        customArgs.push('--referer', pageUrl);
+    }
+    customArgs.push('--merge-output-format', 'mp4', '-o', outputFile, mediaUrl);
+
+    runYtDlpJob(job, customArgs, outputFile);
+
+    res.json({ success: true, jobId: job.id });
+});
+
+app.get('/start-download-video', (req, res) => {
+    const { videoId, quality, filename } = req.query;
+    if (!videoId || !quality) return res.status(400).json({ error: 'Missing parameters' });
+
+    const heightMatch = quality.match(/(\d+)p/);
+    const targetHeight = heightMatch ? parseInt(heightMatch[1]) : 720;
+    const formatSelector = `bestvideo[height<=${targetHeight}]+bestaudio[ext=m4a]/bestaudio/best[height<=${targetHeight}]`;
+
+    const outputFile = path.join(__dirname, `${videoId}_${targetHeight}p_merged.mp4`);
+    const job = createJob(filename || `${videoId}.mp4`);
+
+    const customArgs = [
+        '-f', formatSelector,
+        '--merge-output-format', 'mp4',
+        '-o', outputFile,
+        `https://www.youtube.com/watch?v=${videoId}`
+    ];
+
+    runYtDlpJob(job, customArgs, outputFile);
+
+    res.json({ success: true, jobId: job.id });
+});
+
+app.get('/job-status', (req, res) => {
+    const jobId = req.query.id;
+    const job = jobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json(job);
+});
+
+app.get('/get-job-file', (req, res) => {
+    const jobId = req.query.id;
+    const job = jobs.get(jobId);
+    if (!job || !job.outputFile || !fs.existsSync(job.outputFile)) {
+        return res.status(404).json({ error: 'File not ready or found' });
+    }
+
+    res.download(job.outputFile, job.filename, (err) => {
+        if (err) console.error('File send error:', err);
+        setTimeout(() => {
+            fs.unlink(job.outputFile, (uErr) => {
+                if (!uErr) console.log(`Cleaned up temp file: ${job.outputFile}`);
+            });
+            jobs.delete(jobId);
+        }, 5000);
+    });
+});
 
 app.get('/formats', async (req, res) => {
     const videoId = req.query.id;
@@ -121,7 +252,18 @@ app.get('/download', async (req, res) => {
         return res.status(400).json({ error: 'Invalid quality format' });
     }
     const height = parseInt(heightMatch[1]);
-    await downloadAndMerge(videoId, height, res, filename);
+    const outputFile = path.join(__dirname, `${videoId}_${height}p_merged.mp4`);
+    const formatSelector = `bestvideo[height<=${height}]+bestaudio[ext=m4a]/bestaudio/best[height<=${height}]`;
+    const command = `yt-dlp -f "${formatSelector}" ${YT_DLP_FLAGS} --merge-output-format mp4 -o "${outputFile}" "https://www.youtube.com/watch?v=${videoId}"`;
+    try {
+        const { stdout, stderr } = await execPromise(command);
+        if (!fs.existsSync(outputFile)) throw new Error('Merged file not found');
+        res.download(outputFile, filename || `${videoId}.mp4`, () => {
+            setTimeout(() => fs.unlink(outputFile, () => {}), 5000);
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/formats-url', async (req, res) => {
@@ -159,7 +301,6 @@ app.get('/formats-url', async (req, res) => {
                 }
             });
         } else if (data.url) {
-            // Single-format extraction (common for generic extractor)
             formats.push({
                 type: 'video',
                 label: `${data.height || 'source'}p`,
@@ -181,8 +322,6 @@ app.get('/formats-url', async (req, res) => {
     }
 });
 
-// Direct download+merge for a sniffed media URL (e.g. .m3u8 caught by the
-// extension's network listener). yt-dlp handles HLS/DASH segment merging.
 app.get('/download-url', async (req, res) => {
     const { mediaUrl, pageUrl, filename } = req.query;
     if (!mediaUrl) return res.status(400).json({ error: 'Missing mediaUrl' });
@@ -191,24 +330,16 @@ app.get('/download-url', async (req, res) => {
     const outputFile = path.join(__dirname, `${Date.now()}_${safeName}`);
     const refererFlag = pageUrl ? `--referer "${pageUrl}"` : '';
     const command = `yt-dlp ${YT_DLP_FLAGS} ${refererFlag} --merge-output-format mp4 -o "${outputFile}" "${mediaUrl}"`;
-    console.log(`Running: ${command}`);
 
     try {
         const { stdout, stderr } = await execPromise(command);
-        console.log('yt-dlp output:', stdout);
-        if (stderr) console.error('yt-dlp stderr:', stderr);
         if (!fs.existsSync(outputFile)) throw new Error('Downloaded file not found');
-
-        res.download(outputFile, filename || 'video.mp4', (err) => {
-            if (err) console.error('Download send error:', err);
-            setTimeout(() => {
-                fs.unlink(outputFile, () => {});
-            }, 5000);
+        res.download(outputFile, filename || 'video.mp4', () => {
+            setTimeout(() => fs.unlink(outputFile, () => {}), 5000);
         });
     } catch (err) {
-        console.error('Download-url error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.listen(3000, () => console.log('yt-dlp+ffmpeg server on http://localhost:3000'));
+app.listen(3000, () => console.log('yt-dlp+ffmpeg server on http://localhost:3000'));
