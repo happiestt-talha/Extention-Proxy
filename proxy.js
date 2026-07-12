@@ -14,7 +14,7 @@ app.use(cors({ origin: '*' }));
 // (cookies expire / get rotated over time).
 const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
 const DENO_PATH = 'C:\\Users\\mtalh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe\\deno.exe';
-const YT_DLP_FLAGS = `--cookies "${COOKIES_FILE}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github`;
+const YT_DLP_FLAGS = `--cookies "${COOKIES_FILE}" --js-runtimes "deno:${DENO_PATH}" --remote-components ejs:github --no-check-certificate`;
 
 async function downloadAndMerge(videoId, targetHeight, res, customFilename) {
     const outputFile = path.join(__dirname, `${videoId}_${targetHeight}p_merged.mp4`);
