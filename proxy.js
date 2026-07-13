@@ -175,8 +175,9 @@ app.get('/formats-url', async (req, res) => {
 
         res.json({ formats, title: data.title, thumbnail: data.thumbnail });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
+        const cleanErr = err.stderr ? err.stderr.trim() : err.message;
+        console.warn(`[formats-url] yt-dlp generic extraction warning for ${pageUrl}:\n  ${cleanErr}`);
+        res.status(422).json({ error: 'Unsupported URL', details: cleanErr });
     }
 });
 
