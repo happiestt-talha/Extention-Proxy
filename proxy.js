@@ -124,4 +124,90 @@ app.get('/download', async (req, res) => {
     await downloadAndMerge(videoId, height, res, filename);
 });
 
-app.listen(3000, () => console.log('yt-dlp+ffmpeg server on http://localhost:3000'));
+app.get('/formats-url', async (req, res) => {
+    const pageUrl = req.query.url;
+    if (!pageUrl) return res.status(400).json({ error: 'Missing url' });
+
+    console.log(`Fetching formats for arbitrary URL: ${pageUrl}`);
+    try {
+        const { stdout } = await execPromise(`yt-dlp -j ${YT_DLP_FLAGS} "${pageUrl}"`);
+        const data = JSON.parse(stdout);
+
+        const formats = [];
+        const seenResolutions = new Set();
+
+        if (data.formats) {
+            data.formats.forEach(f => {
+                if (f.vcodec !== 'none' && f.acodec !== 'none') {
+                    if (!seenResolutions.has(f.height)) {
+                        seenResolutions.add(f.height);
+                        formats.push({
+                            type: 'video',
+                            label: `${f.height || '?'}p (combined)`,
+                            height: f.height,
+                            url: f.url,
+                            extension: f.ext || 'mp4'
+                        });
+                    }
+                } else if (f.vcodec === 'none' && f.acodec !== 'none') {
+                    formats.push({
+                        type: 'audio',
+                        label: `${f.abr || '?'}kbps ${f.acodec?.toUpperCase() || ''} (${f.ext})`,
+                        url: f.url,
+                        extension: f.ext || 'm4a'
+                    });
+                }
+            });
+        } else if (data.url) {
+            // Single-format extraction (common for generic extractor)
+            formats.push({
+                type: 'video',
+                label: `${data.height || 'source'}p`,
+                height: data.height,
+                url: data.url,
+                extension: data.ext || 'mp4'
+            });
+        }
+
+        formats.sort((a, b) => (b.height || 0) - (a.height || 0));
+
+        if (formats.length === 0) throw new Error('No formats found');
+
+        res.json({ formats, title: data.title, thumbnail: data.thumbnail });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Direct download+merge for a sniffed media URL (e.g. .m3u8 caught by the
+// extension's network listener). yt-dlp handles HLS/DASH segment merging.
+app.get('/download-url', async (req, res) => {
+    const { mediaUrl, pageUrl, filename } = req.query;
+    if (!mediaUrl) return res.status(400).json({ error: 'Missing mediaUrl' });
+
+    const safeName = (filename || 'video').replace(/[^\w\-. ]/g, '_');
+    const outputFile = path.join(__dirname, `${Date.now()}_${safeName}`);
+    const refererFlag = pageUrl ? `--referer "${pageUrl}"` : '';
+    const command = `yt-dlp ${YT_DLP_FLAGS} ${refererFlag} --merge-output-format mp4 -o "${outputFile}" "${mediaUrl}"`;
+    console.log(`Running: ${command}`);
+
+    try {
+        const { stdout, stderr } = await execPromise(command);
+        console.log('yt-dlp output:', stdout);
+        if (stderr) console.error('yt-dlp stderr:', stderr);
+        if (!fs.existsSync(outputFile)) throw new Error('Downloaded file not found');
+
+        res.download(outputFile, filename || 'video.mp4', (err) => {
+            if (err) console.error('Download send error:', err);
+            setTimeout(() => {
+                fs.unlink(outputFile, () => {});
+            }, 5000);
+        });
+    } catch (err) {
+        console.error('Download-url error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.listen(3000, () => console.log('yt-dlp+ffmpeg server on http://localhost:3000'));
